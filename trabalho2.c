@@ -28,10 +28,10 @@ const char* UART_DEVICE = "/dev/serial0";
 
 // --- Protótipos das Funções ---
 int abrir_e_configurar_uart();
-short calcula_CRC(unsigned char *commands, int size);
 short CRC16(short crc, char data);
+short calcula_CRC(unsigned char *commands, int size);
 void print_buffer_hex(const char* label, const uint8_t* buffer, int length);
-void poll_command_registers();
+void poll_command_registers(int uart_fd);
 void parse_and_execute_commands(const uint8_t* data, int data_len);
 
 /**
@@ -40,12 +40,14 @@ void parse_and_execute_commands(const uint8_t* data, int data_len);
 int main() {
     printf("Iniciando controle da máquina via Modbus RTU...\n");
     printf("Pressione CTRL+C para sair.\n");
+    int uart_fd = abrir_e_configurar_uart();
+    if (uart_fd == -1) return 1;
 
     while (1) {
-        poll_command_registers();
+        poll_command_registers(uart_fd);
         usleep(50000); // Aguarda 50 ms antes da próxima leitura
     }
-
+    close(uart_fd);
     return 0;
 }
 
@@ -87,30 +89,23 @@ int abrir_e_configurar_uart() {
  * @brief Constrói e envia uma solicitação Modbus para ler os registradores de
  * comando da ESP32 e processa a resposta.
  */
-void poll_command_registers() {
-    int uart_fd = abrir_e_configurar_uart();
-    if (uart_fd == -1) return;
-
+void poll_command_registers(int uart_fd) {
     // Frame de requisição (Função 0x03): Ler 2 registradores a partir do endereço 0x0000
     // Payload customizado: [START_ADDR_HI] [START_ADDR_LO] [QTD_REGS_HI] [QTD_REGS_LO] [MATRICULA]
-    uint8_t payload[2 + 2 + 4];
-    payload[0] = (REG_ADDR_CMD_X >> 8) & 0xFF; // Endereço inicial (High)
-    payload[1] = REG_ADDR_CMD_X & 0xFF;       // Endereço inicial (Low)
-    payload[2] = 0x00;                        // Quantidade de regs (High)
-    payload[3] = 0x02;                        // Quantidade de regs (Low) -> Ler 2 registradores
+    size_t payload_sz = 2 + 2 + 4 + 2;
+    unsigned char payload[payload_sz];
+    payload[0] = ESP32_ADDRESS; // Endereço da ESP32
+    payload[1] = FUNC_READ_REGS;// Registrador de leitura
+    payload[2] = 0x0D; // EIXO X
+    payload[3] = 0x01; // Quantidade de regs (Low) -> Ler 2 registradores
     memcpy(&payload[4], MATRICULA, 4);
-
-    uint8_t frame_sem_crc[1 + 1 + sizeof(payload)];
-    frame_sem_crc[0] = ESP32_ADDRESS;
-    frame_sem_crc[1] = FUNC_READ_REGS;
-    memcpy(&frame_sem_crc[2], payload, sizeof(payload));
     
-    uint16_t crc = calcula_CRC(frame_sem_crc, sizeof(frame_sem_crc));
+    short crc = calcula_CRC(payload, 10);
 
-    uint8_t tx_buffer[sizeof(frame_sem_crc) + 2];
-    memcpy(tx_buffer, frame_sem_crc, sizeof(frame_sem_crc));
-    tx_buffer[sizeof(frame_sem_crc)] = crc & 0xFF;
-    tx_buffer[sizeof(frame_sem_crc) + 1] = (crc >> 8) & 0xFF;
+    unsigned char tx_buffer[sizeof(payload)];
+    memcpy(tx_buffer, payload, sizeof(payload));
+    tx_buffer[payload_sz - 2] = (unsigned char)(crc & 0xFF);
+    tx_buffer[payload_sz - 1] = (unsigned char)((crc >> 8) & 0xFF);
 
     print_buffer_hex("--> Enviando Leitura", tx_buffer, sizeof(tx_buffer));
     if (write(uart_fd, tx_buffer, sizeof(tx_buffer)) <= 0) {
@@ -118,7 +113,8 @@ void poll_command_registers() {
         close(uart_fd);
         return;
     }
-
+    tcflush(uart_fd, TCIFLUSH);
+    usleep(100);
     // --- Leitura e Validação da Resposta ---
     uint8_t rx_buffer[256];
     int bytes_lidos = read(uart_fd, rx_buffer, 255);
@@ -129,8 +125,8 @@ void poll_command_registers() {
         if (bytes_lidos < 5) { // Mínimo: [ADDR][FUNC][BYTE_COUNT][CRC1][CRC2]
             printf("Erro: Resposta Modbus muito curta.\n");
         } else {
-            uint16_t crc_recebido = (rx_buffer[bytes_lidos - 1] << 8) | rx_buffer[bytes_lidos - 2];
-            uint16_t crc_calculado = calcula_CRC(rx_buffer, bytes_lidos - 2);
+            short crc_recebido = (rx_buffer[bytes_lidos - 1] << 8) | rx_buffer[bytes_lidos - 2];
+            short crc_calculado = calcula_CRC(rx_buffer, bytes_lidos - 2);
 
             if (crc_calculado != crc_recebido) {
                 printf("ERRO DE CRC! Mensagem descartada.\n");
@@ -143,7 +139,6 @@ void poll_command_registers() {
             }
         }
     }
-    close(uart_fd);
 }
 
 /**
@@ -185,7 +180,7 @@ void parse_and_execute_commands(const uint8_t* data, int data_len) {
  * @return O novo valor do CRC.
  */
 short CRC16(short crc, char data)
- {
+{
      const short tbl[256] = {
          0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
          0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
@@ -230,13 +225,12 @@ short CRC16(short crc, char data)
   */
  short calcula_CRC(unsigned char *commands, int size) {
      int i;
-     short crc = 0xFFFF; // O CRC Modbus RTU deve ser inicializado com 0xFFFF
+     short crc = 0;
      for(i=0;i<size;i++) {
-         crc = CRC16(crc, commands[i]);
+        crc = CRC16(crc, commands[i]);
      }
      return crc;
- }
-
+}
 
 /**
  * @brief Imprime o conteúdo de um buffer em formato hexadecimal.
